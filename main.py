@@ -45,9 +45,10 @@ async def detect_card(data: dict):
     if not image_url:
         return {"error": "No image_url provided."}
 
-    # Use httpx to download image
+    # Use httpx to download image with user-agent
     try:
-        response = httpx.get(image_url, timeout=10.0)
+        headers = {"User-Agent": "Mozilla/5.0"}
+        response = httpx.get(image_url, headers=headers, timeout=10.0)
         response.raise_for_status()
     except Exception as e:
         return {"error": f"Failed to download image: {str(e)}"}
