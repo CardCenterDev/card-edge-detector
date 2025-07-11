@@ -64,17 +64,33 @@ async def detect_card(data: dict):
     if not contours:
         return {"error": "No contours found."}
 
-    # Find the largest contour and ensure it's reasonably sized
-    largest = max(contours, key=cv2.contourArea)
-    area = cv2.contourArea(largest)
-    if area < width * height * 0.3:
-        return {"error": "Largest contour too small to be a card."}
+    # Filter contours that form a 4-sided polygon and have a card-like aspect ratio
+    rect_candidates = []
+    for c in contours:
+        area = cv2.contourArea(c)
+        if area < 500:  # Lower threshold
+            continue
 
-    rotated_rect = cv2.minAreaRect(largest)
+        approx = cv2.approxPolyDP(c, 0.02 * cv2.arcLength(c, True), True)
+        if len(approx) == 4:
+            x, y, w, h = cv2.boundingRect(approx)
+            aspect_ratio = max(w, h) / min(w, h)
+            if 1.2 < aspect_ratio < 1.7:
+                rect_candidates.append((area, c))
+
+    # If no good rectangles found, fallback to largest contour
+    if rect_candidates:
+        _, best_contour = max(rect_candidates, key=lambda x: x[0])
+    else:
+        best_contour = max(contours, key=cv2.contourArea)
+        area = cv2.contourArea(best_contour)
+        if area < 500:
+            return {"error": f"Largest contour too small to be a card. Area={area}"}
+
+    rotated_rect = cv2.minAreaRect(best_contour)
     box = cv2.boxPoints(rotated_rect)
     box = np.intp(box)
-
-    x, y, w, h = cv2.boundingRect(largest)
+    x, y, w, h = cv2.boundingRect(best_contour)
 
     # Draw debug image
     debug_image = image_np.copy()
