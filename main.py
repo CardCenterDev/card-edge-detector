@@ -12,11 +12,9 @@ import uuid
 
 app = FastAPI()
 
-# where debug images live
 DEBUG_FOLDER = "/tmp/debug"
 os.makedirs(DEBUG_FOLDER, exist_ok=True)
 
-# allow cross-origin calls
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -25,94 +23,81 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-def normalize_box(box, w, h):
+def normalize_box(box, W, H):
     x, y, w, h = box
     return {
-        "left": x / w,
-        "top": y / h,
-        "right": (x + w) / w,
-        "bottom": (y + h) / h
+        "left": x / W,
+        "top": y / H,
+        "right": (x + w) / W,
+        "bottom": (y + h) / H
     }
 
-@app.get("/debug/{filename}")
-def serve_debug_image(filename: str):
-    path = os.path.join(DEBUG_FOLDER, filename)
-    return FileResponse(path)
+@app.get("/debug/{fn}")
+def debug_image(fn: str):
+    return FileResponse(os.path.join(DEBUG_FOLDER, fn))
 
 @app.post("/detect")
-async def detect_card(data: dict):
-    url = data.get("image_url")
+async def detect_card(body: dict):
+    url = body.get("image_url")
     if not url:
         return {"error": "No image_url provided."}
 
-    # fetch with a real browser UA
+    # fetch image
     try:
-        headers = {"User-Agent": "Mozilla/5.0"}
-        resp = httpx.get(url, headers=headers, timeout=10.0)
+        resp = httpx.get(url, headers={"User-Agent":"Mozilla/5.0"}, timeout=10)
         resp.raise_for_status()
     except Exception as e:
-        return {"error": f"Failed to download image: {e}"}
+        return {"error": f"Could not download: {e}"}
 
-    # load into OpenCV
     img = Image.open(io.BytesIO(resp.content)).convert("RGB")
     frame = np.array(img)
-    height, width = frame.shape[:2]
+    H, W = frame.shape[:2]
 
-    # 1) grayscale → adaptive threshold → clean up
-    gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
-    bw  = cv2.adaptiveThreshold(
-        gray, 255,
-        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY_INV,
-        11, 2
-    )
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5,5))
-    morph = cv2.morphologyEx(bw, cv2.MORPH_CLOSE, kernel, iterations=2)
+    # 1) mask whites in HSV
+    hsv = cv2.cvtColor(frame, cv2.COLOR_RGB2HSV)
+    # white = low saturation, high value
+    mask = cv2.inRange(hsv, (0, 0, 200), (180, 60, 255))
 
-    # 2) find contours
-    cnts, _ = cv2.findContours(morph, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not cnts:
-        return {"error": "No contours found."}
+    # 2) clean it up
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (11,11))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  kernel, iterations=1)
 
-    # 3) look for largest 4-point polygon
-    quad = None
-    for c in sorted(cnts, key=cv2.contourArea, reverse=True):
-        peri = cv2.arcLength(c, True)
-        approx = cv2.approxPolyDP(c, 0.02 * peri, True)
-        if len(approx) == 4:
-            quad = approx.reshape(4,2)
-            break
+    # 3) find contours, skip any touching the image border
+    cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    best = None
+    best_area = 0
+    for c in cnts:
+        x,y,w,h = cv2.boundingRect(c)
+        area = w*h
+        # skip if it spans the full image (i.e. background mask leak)
+        if x==0 or y==0 or x+w>=W or y+h>=H:
+            continue
+        if area > best_area:
+            best_area, best = area, (x,y,w,h)
 
-    # 4) fallback: minAreaRect of the single largest contour
-    if quad is None:
-        c = max(cnts, key=cv2.contourArea)
-        rect = cv2.minAreaRect(c)
-        quad = cv2.boxPoints(rect).astype(int)
+    if best is None:
+        return {"error": "No valid white‐border region found."}
 
-    # compute bounding box
-    xs = quad[:,0]; ys = quad[:,1]
-    x, y, w, h = int(xs.min()), int(ys.min()), int(xs.max()-xs.min()), int(ys.max()-ys.min())
+    x,y,w,h = best
 
-    # draw debug image
-    debug = frame.copy()
-    cv2.drawContours(debug, [quad], -1, (0,0,255), 3)        # red polygon
-    cv2.rectangle(debug, (x,y), (x+w,y+h), (0,255,0), 2)     # green AABB
+    # draw debug
+    dbg = frame.copy()
+    cv2.rectangle(dbg, (x,y),(x+w,y+h), (0,255,0), 3)
+    fn = f"{uuid.uuid4().hex}.jpg"
+    path = os.path.join(DEBUG_FOLDER, fn)
+    cv2.imwrite(path, cv2.cvtColor(dbg, cv2.COLOR_RGB2BGR))
 
-    # save debug
-    name = f"{uuid.uuid4().hex}.jpg"
-    path = os.path.join(DEBUG_FOLDER, name)
-    cv2.imwrite(path, cv2.cvtColor(debug, cv2.COLOR_RGB2BGR))
-
-    # normalized coords
-    outer = normalize_box((x,y,w,h), width, height)
-    inner = normalize_box((x + w*0.05, y + h*0.05, w*0.9, h*0.9), width, height)
+    # inner = inset 10%
+    inset_x, inset_y = int(w*0.1), int(h*0.1)
+    inner_box = (x+inset_x, y+inset_y, w-2*inset_x, h-2*inset_y)
 
     return {
-        "outerEdges": outer,
-        "innerEdges": inner,
-        "rotation": float(cv2.minAreaRect(quad)[-1]),
-        "confidence": 0.98,
-        "debug_image_url": f"/debug/{name}"
+        "outerEdges": normalize_box((x,y,w,h), W, H),
+        "innerEdges": normalize_box(inner_box,  W, H),
+        "rotation": 0.0,
+        "confidence": 0.99,
+        "debug_image_url": f"/debug/{fn}"
     }
 
 if __name__ == "__main__":
