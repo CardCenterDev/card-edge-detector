@@ -1,61 +1,48 @@
-from fastapi import FastAPI, Query
-from pydantic import BaseModel
-import requests
-import numpy as np
+from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
+import uvicorn
 import cv2
-from typing import Optional
-from fastapi.responses import JSONResponse
+import numpy as np
+import requests
+import io
+from PIL import Image
 
 app = FastAPI()
 
-class EdgeResult(BaseModel):
-    outerEdges: dict
-    innerEdges: dict
-    rotation: Optional[float] = 0.0
-    confidence: Optional[float] = 0.95
+# Enable CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # You can lock this down later
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-def fetch_image_from_url(url):
-    resp = requests.get(url, stream=True).raw
-    img_array = np.asarray(bytearray(resp.read()), dtype=np.uint8)
-    return cv2.imdecode(img_array, cv2.IMREAD_COLOR)
+@app.post("/detect")
+async def detect_card(data: dict):
+    image_url = data.get("image_url")
+    if not image_url:
+        return {"error": "No image_url provided."}
 
-def detect_card_edges(image):
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    edges = cv2.Canny(gray, 100, 200)
+    # Download image
+    response = requests.get(image_url)
+    if response.status_code != 200:
+        return {"error": "Failed to download image."}
 
-    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    card_contour = max(contours, key=cv2.contourArea)
+    image = Image.open(io.BytesIO(response.content)).convert("RGB")
+    image_np = np.array(image)
+    height, width = image_np.shape[:2]
 
-    x, y, w, h = cv2.boundingRect(card_contour)
-
-    img_h, img_w = image.shape[:2]
-    outerEdges = {
-        "left": round(x / img_w, 3),
-        "top": round(y / img_h, 3),
-        "right": round((x + w) / img_w, 3),
-        "bottom": round((y + h) / img_h, 3)
-    }
-
-    # Inner edge logic placeholder — approximate for now
-    innerEdges = {
-        "left": round((x + 0.05 * w) / img_w, 3),
-        "top": round((y + 0.05 * h) / img_h, 3),
-        "right": round((x + 0.95 * w) / img_w, 3),
-        "bottom": round((y + 0.95 * h) / img_h, 3)
-    }
-
+    # === Simple placeholder logic ===
+    outer = {"left": 0.05, "top": 0.05, "right": 0.95, "bottom": 0.95}
+    inner = {"left": 0.10, "top": 0.10, "right": 0.90, "bottom": 0.90}
     return {
-        "outerEdges": outerEdges,
-        "innerEdges": innerEdges,
+        "outerEdges": outer,
+        "innerEdges": inner,
         "rotation": 0.0,
         "confidence": 0.95
     }
 
-@app.get("/analyze", response_model=EdgeResult)
-async def analyze_card(image_url: str = Query(...)):
-    try:
-        img = fetch_image_from_url(image_url)
-        result = detect_card_edges(img)
-        return JSONResponse(content=result)
-    except Exception as e:
-        return JSONResponse(status_code=500, content={"error": str(e)})
+# Optional: only for local dev
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=8000)
