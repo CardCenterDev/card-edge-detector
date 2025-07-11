@@ -4,7 +4,7 @@ from fastapi.responses import FileResponse
 import uvicorn
 import cv2
 import numpy as np
-import requests
+import httpx  # Replaces requests
 import io
 import os
 from PIL import Image
@@ -45,10 +45,12 @@ async def detect_card(data: dict):
     if not image_url:
         return {"error": "No image_url provided."}
 
-    # Download image
-    response = requests.get(image_url)
-    if response.status_code != 200:
-        return {"error": "Failed to download image."}
+    # Use httpx to download image
+    try:
+        response = httpx.get(image_url, timeout=10.0)
+        response.raise_for_status()
+    except Exception as e:
+        return {"error": f"Failed to download image: {str(e)}"}
 
     image = Image.open(io.BytesIO(response.content)).convert("RGB")
     image_np = np.array(image)
