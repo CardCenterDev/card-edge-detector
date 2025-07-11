@@ -1,5 +1,0 @@
-fastapi
-uvicorn
-numpy
-opencv-python-headless
-requests
