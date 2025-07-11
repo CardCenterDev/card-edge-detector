@@ -12,11 +12,11 @@ import uuid
 
 app = FastAPI()
 
-# Writable directory for Render
+# where debug images live
 DEBUG_FOLDER = "/tmp/debug"
 os.makedirs(DEBUG_FOLDER, exist_ok=True)
 
-# Allow CORS
+# allow cross-origin calls
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -25,13 +25,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-def normalize_box(box, width, height):
+def normalize_box(box, w, h):
     x, y, w, h = box
     return {
-        "left": x / width,
-        "top": y / height,
-        "right": (x + w) / width,
-        "bottom": (y + h) / height
+        "left": x / w,
+        "top": y / h,
+        "right": (x + w) / w,
+        "bottom": (y + h) / h
     }
 
 @app.get("/debug/{filename}")
@@ -41,76 +41,78 @@ def serve_debug_image(filename: str):
 
 @app.post("/detect")
 async def detect_card(data: dict):
-    image_url = data.get("image_url")
-    if not image_url:
+    url = data.get("image_url")
+    if not url:
         return {"error": "No image_url provided."}
 
+    # fetch with a real browser UA
     try:
         headers = {"User-Agent": "Mozilla/5.0"}
-        response = httpx.get(image_url, headers=headers, timeout=10.0)
-        response.raise_for_status()
+        resp = httpx.get(url, headers=headers, timeout=10.0)
+        resp.raise_for_status()
     except Exception as e:
-        return {"error": f"Failed to download image: {str(e)}"}
+        return {"error": f"Failed to download image: {e}"}
 
-    image = Image.open(io.BytesIO(response.content)).convert("RGB")
-    image_np = np.array(image)
-    height, width = image_np.shape[:2]
+    # load into OpenCV
+    img = Image.open(io.BytesIO(resp.content)).convert("RGB")
+    frame = np.array(img)
+    height, width = frame.shape[:2]
 
-    gray = cv2.cvtColor(image_np, cv2.COLOR_RGB2GRAY)
-    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-    edges = cv2.Canny(blurred, 50, 150)
+    # 1) grayscale → adaptive threshold → clean up
+    gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
+    bw  = cv2.adaptiveThreshold(
+        gray, 255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY_INV,
+        11, 2
+    )
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5,5))
+    morph = cv2.morphologyEx(bw, cv2.MORPH_CLOSE, kernel, iterations=2)
 
-    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
+    # 2) find contours
+    cnts, _ = cv2.findContours(morph, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not cnts:
         return {"error": "No contours found."}
 
-    # Filter contours that form a 4-sided polygon and have a card-like aspect ratio
-    rect_candidates = []
-    for c in contours:
-        area = cv2.contourArea(c)
-        if area < 500:  # Lower threshold
-            continue
-
-        approx = cv2.approxPolyDP(c, 0.02 * cv2.arcLength(c, True), True)
+    # 3) look for largest 4-point polygon
+    quad = None
+    for c in sorted(cnts, key=cv2.contourArea, reverse=True):
+        peri = cv2.arcLength(c, True)
+        approx = cv2.approxPolyDP(c, 0.02 * peri, True)
         if len(approx) == 4:
-            x, y, w, h = cv2.boundingRect(approx)
-            aspect_ratio = max(w, h) / min(w, h)
-            if 1.2 < aspect_ratio < 1.7:
-                rect_candidates.append((area, c))
+            quad = approx.reshape(4,2)
+            break
 
-    # If no good rectangles found, fallback to largest contour
-    if rect_candidates:
-        _, best_contour = max(rect_candidates, key=lambda x: x[0])
-    else:
-        best_contour = max(contours, key=cv2.contourArea)
-        area = cv2.contourArea(best_contour)
-        if area < 500:
-            return {"error": f"Largest contour too small to be a card. Area={area}"}
+    # 4) fallback: minAreaRect of the single largest contour
+    if quad is None:
+        c = max(cnts, key=cv2.contourArea)
+        rect = cv2.minAreaRect(c)
+        quad = cv2.boxPoints(rect).astype(int)
 
-    rotated_rect = cv2.minAreaRect(best_contour)
-    box = cv2.boxPoints(rotated_rect)
-    box = np.intp(box)
-    x, y, w, h = cv2.boundingRect(best_contour)
+    # compute bounding box
+    xs = quad[:,0]; ys = quad[:,1]
+    x, y, w, h = int(xs.min()), int(ys.min()), int(xs.max()-xs.min()), int(ys.max()-ys.min())
 
-    # Draw debug image
-    debug_image = image_np.copy()
-    cv2.drawContours(debug_image, [box], 0, (0, 0, 255), 2)  # red rotated box
-    cv2.rectangle(debug_image, (x, y), (x + w, y + h), (0, 255, 0), 2)  # green bounding box
+    # draw debug image
+    debug = frame.copy()
+    cv2.drawContours(debug, [quad], -1, (0,0,255), 3)        # red polygon
+    cv2.rectangle(debug, (x,y), (x+w,y+h), (0,255,0), 2)     # green AABB
 
-    debug_filename = f"{uuid.uuid4().hex}.jpg"
-    debug_path = os.path.join(DEBUG_FOLDER, debug_filename)
-    cv2.imwrite(debug_path, cv2.cvtColor(debug_image, cv2.COLOR_RGB2BGR))
+    # save debug
+    name = f"{uuid.uuid4().hex}.jpg"
+    path = os.path.join(DEBUG_FOLDER, name)
+    cv2.imwrite(path, cv2.cvtColor(debug, cv2.COLOR_RGB2BGR))
 
-    # Return normalized coordinates and metadata
-    outer = normalize_box((x, y, w, h), width, height)
-    inner = normalize_box((x + w * 0.1, y + h * 0.1, w * 0.8, h * 0.8), width, height)
+    # normalized coords
+    outer = normalize_box((x,y,w,h), width, height)
+    inner = normalize_box((x + w*0.05, y + h*0.05, w*0.9, h*0.9), width, height)
 
     return {
         "outerEdges": outer,
         "innerEdges": inner,
-        "rotation": rotated_rect[-1],
-        "confidence": 0.95,
-        "debug_image_url": f"/debug/{debug_filename}"
+        "rotation": float(cv2.minAreaRect(quad)[-1]),
+        "confidence": 0.98,
+        "debug_image_url": f"/debug/{name}"
     }
 
 if __name__ == "__main__":
