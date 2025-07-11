@@ -1,7 +1,6 @@
-httpx
 fastapi
-uvicorn
+uvicorn[standard]
+httpx
 opencv-python-headless
-pillow
-requests
 numpy
+pillow

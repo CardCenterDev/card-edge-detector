@@ -1,6 +1,6 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 import uvicorn
 import cv2
 import numpy as np
@@ -12,9 +12,11 @@ import uuid
 
 app = FastAPI()
 
+# Render’s writable directory
 DEBUG_FOLDER = "/tmp/debug"
 os.makedirs(DEBUG_FOLDER, exist_ok=True)
 
+# Enable CORS for any origin (you can lock this down later)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -23,82 +25,87 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-def normalize_box(box, W, H):
+def normalize_box(box, width, height):
     x, y, w, h = box
     return {
-        "left": x / W,
-        "top": y / H,
-        "right": (x + w) / W,
-        "bottom": (y + h) / H
+        "left": x / width,
+        "top": y / height,
+        "right": (x + w) / width,
+        "bottom": (y + h) / height
     }
 
-@app.get("/debug/{fn}")
-def debug_image(fn: str):
-    return FileResponse(os.path.join(DEBUG_FOLDER, fn))
+@app.get("/debug/{filename}")
+async def serve_debug_image(filename: str):
+    path = os.path.join(DEBUG_FOLDER, filename)
+    if not os.path.exists(path):
+        return JSONResponse({"error": "Debug image not found."}, status_code=404)
+    return FileResponse(path)
 
-@app.post("/detect")
-async def detect_card(body: dict):
-    url = body.get("image_url")
-    if not url:
-        return {"error": "No image_url provided."}
+@app.post("/process_image")
+async def process_image(data: dict):
+    image_url = data.get("imageUrl") or data.get("image_url")
+    if not image_url:
+        return JSONResponse({"error": "No imageUrl provided."}, status_code=400)
 
-    # fetch image
+    # 1) download
     try:
-        resp = httpx.get(url, headers={"User-Agent":"Mozilla/5.0"}, timeout=10)
+        headers = {"User-Agent": "Mozilla/5.0"}
+        resp = httpx.get(image_url, headers=headers, timeout=15.0)
         resp.raise_for_status()
     except Exception as e:
-        return {"error": f"Could not download: {e}"}
+        return JSONResponse({"error": f"Failed to download image: {e}"}, status_code=400)
 
+    # 2) decode
     img = Image.open(io.BytesIO(resp.content)).convert("RGB")
-    frame = np.array(img)
-    H, W = frame.shape[:2]
+    image_np = np.array(img)
+    h, w = image_np.shape[:2]
 
-    # 1) mask whites in HSV
-    hsv = cv2.cvtColor(frame, cv2.COLOR_RGB2HSV)
-    # white = low saturation, high value
-    mask = cv2.inRange(hsv, (0, 0, 200), (180, 60, 255))
+    # 3) preprocess + edges
+    gray = cv2.cvtColor(image_np, cv2.COLOR_RGB2GRAY)
+    blur = cv2.GaussianBlur(gray, (5,5), 0)
+    edges = cv2.Canny(blur, 50, 150)
 
-    # 2) clean it up
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (11,11))
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  kernel, iterations=1)
+    # 4) find contours
+    cnts, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not cnts:
+        return JSONResponse({"error": "No contours found."}, status_code=422)
 
-    # 3) find contours, skip any touching the image border
-    cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    best = None
-    best_area = 0
-    for c in cnts:
-        x,y,w,h = cv2.boundingRect(c)
-        area = w*h
-        # skip if it spans the full image (i.e. background mask leak)
-        if x==0 or y==0 or x+w>=W or y+h>=H:
-            continue
-        if area > best_area:
-            best_area, best = area, (x,y,w,h)
+    # 5) pick the biggest
+    best = max(cnts, key=cv2.contourArea)
+    area = cv2.contourArea(best)
+    if area < (w * h * 0.05):
+        return JSONResponse({"error": "Largest contour too small."}, status_code=422)
 
-    if best is None:
-        return {"error": "No valid white‐border region found."}
+    # 6) get bounding rect + minAreaRect
+    x,y,ww,hh = cv2.boundingRect(best)
+    rot = cv2.minAreaRect(best)
+    box = cv2.boxPoints(rot)
+    box = np.intp(box)
 
-    x,y,w,h = best
+    # 7) draw debug overlay
+    dbg = image_np.copy()
+    cv2.drawContours(dbg, [box], 0, (0,0,255), 2)
+    cv2.rectangle(dbg, (x,y), (x+ww,y+hh), (0,255,0), 2)
 
-    # draw debug
-    dbg = frame.copy()
-    cv2.rectangle(dbg, (x,y),(x+w,y+h), (0,255,0), 3)
-    fn = f"{uuid.uuid4().hex}.jpg"
-    path = os.path.join(DEBUG_FOLDER, fn)
+    filename = f"{uuid.uuid4().hex}.jpg"
+    path = os.path.join(DEBUG_FOLDER, filename)
     cv2.imwrite(path, cv2.cvtColor(dbg, cv2.COLOR_RGB2BGR))
 
-    # inner = inset 10%
-    inset_x, inset_y = int(w*0.1), int(h*0.1)
-    inner_box = (x+inset_x, y+inset_y, w-2*inset_x, h-2*inset_y)
+    # 8) normalize
+    outer = normalize_box((x,y,ww,hh), w, h)
+    inner = normalize_box((x+ww*0.1, y+hh*0.1, ww*0.8, hh*0.8), w, h)
+
+    # 9) full debug URL
+    base = os.environ.get("RENDER_EXTERNAL_URL") or ""  # set via Render dashboard
+    debug_url = f"{base}/debug/{filename}"
 
     return {
-        "outerEdges": normalize_box((x,y,w,h), W, H),
-        "innerEdges": normalize_box(inner_box,  W, H),
-        "rotation": 0.0,
-        "confidence": 0.99,
-        "debug_image_url": f"/debug/{fn}"
+        "outerEdges": outer,
+        "innerEdges": inner,
+        "rotation": rot[-1],
+        "confidence": 0.95,
+        "debug_image_url": debug_url
     }
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run("main:app", host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))

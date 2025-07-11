@@ -2,6 +2,11 @@ services:
   - type: web
     name: card-edge-detector
     env: python
-    buildCommand: pip install -r requirements.txt
-    startCommand: uvicorn main:app --host 0.0.0.0 --port 10000
     plan: free
+    region: oregon
+    branch: main
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: RENDER_EXTERNAL_URL
+        value: https://card-edge-detector.onrender.com
