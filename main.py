@@ -1,3 +1,4 @@
+# main.py
 from flask import Flask, request, jsonify
 import requests
 import cv2
@@ -6,14 +7,14 @@ import numpy as np
 app = Flask(__name__)
 
 # --- Configuration ---
-# Standard trading card dimensions (e.g., Magic: The Gathering, Pokemon)
 STANDARD_CARD_WIDTH_MM = 63.5
 STANDARD_CARD_HEIGHT_MM = 88.9
 
 @app.route('/process_image', methods=['POST'])
 def process_image():
-    data = request.get_json()
-    image_url = data.get('imageUrl')
+    data = request.get_json(force=True)  # always parse JSON
+    # accept either key
+    image_url = data.get('imageUrl') or data.get('image_url')
     if not image_url:
         return jsonify({"error": "No image URL provided"}), 400
 
@@ -32,13 +33,13 @@ def process_image():
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         blurred = cv2.GaussianBlur(gray, (5, 5), 0)
 
-        # 3. Canny edges + findContours
+        # 3. Canny edges + contours
         edges = cv2.Canny(blurred, 50, 150)
         contours, _ = cv2.findContours(edges,
                                        cv2.RETR_EXTERNAL,
                                        cv2.CHAIN_APPROX_SIMPLE)
 
-        # 4. Pick the largest 4-point contour
+        # 4. Largest 4-point rectangle
         card_contour = None
         max_area = 0
         for c in contours:
@@ -51,52 +52,44 @@ def process_image():
                     max_area = area
 
         if card_contour is None:
-            # fallback: full image
+            # fallback → full image
             min_x, min_y, box_w, box_h = 0, 0, w, h
         else:
             min_x, min_y, box_w, box_h = cv2.boundingRect(card_contour)
 
         max_x, max_y = min_x + box_w, min_y + box_h
 
-        # 5. Outer edges normalized
-        outer_left   = min_x / w
-        outer_top    = min_y / h
-        outer_right  = max_x / w
-        outer_bottom = max_y / h
+        # 5. Normalize outer edges
+        outer = {
+            "left":   round(min_x / w, 4),
+            "top":    round(min_y / h, 4),
+            "right":  round(max_x / w, 4),
+            "bottom": round(max_y / h, 4),
+        }
 
-        # 6. Inner edges as fixed inset
+        # 6. Inner edges (5% inset)
         inset_x = box_w * 0.05
         inset_y = box_h * 0.05
-        inner_left   = (min_x + inset_x) / w
-        inner_top    = (min_y + inset_y) / h
-        inner_right  = (max_x - inset_x) / w
-        inner_bottom = (max_y - inset_y) / h
+        inner = {
+            "left":   round((min_x + inset_x) / w, 4),
+            "top":    round((min_y + inset_y) / h, 4),
+            "right":  round((max_x - inset_x) / w, 4),
+            "bottom": round((max_y - inset_y) / h, 4),
+        }
 
-        # 7. Rotation (via minAreaRect)
+        # 7. Rotation
         rotation = 0.0
         if card_contour is not None:
             rect = cv2.minAreaRect(card_contour)
             angle = rect[2]
             # normalize to [-45,45]
-            if angle < -45:
-                angle += 90
-            elif angle > 45:
-                angle -= 90
-            rotation = float(f"{angle:.2f}")
+            if angle < -45: angle += 90
+            elif angle > 45: angle -= 90
+            rotation = round(angle, 2)
 
         return jsonify({
-            "outerEdges": {
-                "left": float(f"{outer_left:.4f}"),
-                "top": float(f"{outer_top:.4f}"),
-                "right": float(f"{outer_right:.4f}"),
-                "bottom": float(f"{outer_bottom:.4f}")
-            },
-            "innerEdges": {
-                "left": float(f"{inner_left:.4f}"),
-                "top": float(f"{inner_top:.4f}"),
-                "right": float(f"{inner_right:.4f}"),
-                "bottom": float(f"{inner_bottom:.4f}")
-            },
+            "outerEdges": outer,
+            "innerEdges": inner,
             "rotation": rotation,
             "confidence": 0.9
         }), 200
@@ -108,5 +101,5 @@ def process_image():
 
 
 if __name__ == '__main__':
-    # for local dev only
+    # for local dev:
     app.run(host='0.0.0.0', port=5000, debug=True)
