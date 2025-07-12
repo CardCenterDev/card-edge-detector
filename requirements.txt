@@ -1,6 +1,4 @@
-fastapi
-uvicorn[standard]
-httpx
+Flask>=2.0
 opencv-python-headless
 numpy
-pillow
+requests

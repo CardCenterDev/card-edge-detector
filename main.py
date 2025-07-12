@@ -1,115 +1,112 @@
-# main.py
-from fastapi import FastAPI, Request
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
-import uvicorn, uuid, os, io, httpx
-import cv2, numpy as np
-from PIL import Image
+from flask import Flask, request, jsonify
+import requests
+import cv2
+import numpy as np
 
-app = FastAPI()
-DEBUG_FOLDER = "/tmp/debug"
-os.makedirs(DEBUG_FOLDER, exist_ok=True)
+app = Flask(__name__)
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# --- Configuration ---
+# Standard trading card dimensions (e.g., Magic: The Gathering, Pokemon)
+STANDARD_CARD_WIDTH_MM = 63.5
+STANDARD_CARD_HEIGHT_MM = 88.9
 
-def normalize(edges, W, H):
-    return {k: round(v/(W if k in ("left","right") else H), 4) for k,v in edges.items()}
+@app.route('/process_image', methods=['POST'])
+def process_image():
+    data = request.get_json()
+    image_url = data.get('imageUrl')
+    if not image_url:
+        return jsonify({"error": "No image URL provided"}), 400
 
-@app.get("/debug/{fn}")
-def debug_img(fn: str):
-    p = os.path.join(DEBUG_FOLDER, fn)
-    if not os.path.exists(p):
-        return JSONResponse({"error":"not found"}, 404)
-    return FileResponse(p)
-
-@app.post("/process_image")
-async def proc(req: Request):
-    js = await req.json()
-    url = js.get("imageUrl") or js.get("image_url")
-    if not url:
-        return JSONResponse({"error":"no URL"},400)
-
-    # fetch
     try:
-        r = httpx.get(url, headers={"User-Agent":"Mozilla/5.0"}, timeout=10)
-        r.raise_for_status()
+        # 1. Download the image
+        resp = requests.get(image_url, timeout=10)
+        resp.raise_for_status()
+        buf = np.frombuffer(resp.content, dtype=np.uint8)
+        img = cv2.imdecode(buf, cv2.IMREAD_COLOR)
+        if img is None:
+            raise ValueError("Could not decode image from URL.")
+
+        h, w, _ = img.shape
+
+        # 2. Grayscale + blur
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+
+        # 3. Canny edges + findContours
+        edges = cv2.Canny(blurred, 50, 150)
+        contours, _ = cv2.findContours(edges,
+                                       cv2.RETR_EXTERNAL,
+                                       cv2.CHAIN_APPROX_SIMPLE)
+
+        # 4. Pick the largest 4-point contour
+        card_contour = None
+        max_area = 0
+        for c in contours:
+            peri = cv2.arcLength(c, True)
+            approx = cv2.approxPolyDP(c, 0.02 * peri, True)
+            if len(approx) == 4:
+                area = cv2.contourArea(approx)
+                if area > max_area and area > (w * h * 0.1):
+                    card_contour = approx
+                    max_area = area
+
+        if card_contour is None:
+            # fallback: full image
+            min_x, min_y, box_w, box_h = 0, 0, w, h
+        else:
+            min_x, min_y, box_w, box_h = cv2.boundingRect(card_contour)
+
+        max_x, max_y = min_x + box_w, min_y + box_h
+
+        # 5. Outer edges normalized
+        outer_left   = min_x / w
+        outer_top    = min_y / h
+        outer_right  = max_x / w
+        outer_bottom = max_y / h
+
+        # 6. Inner edges as fixed inset
+        inset_x = box_w * 0.05
+        inset_y = box_h * 0.05
+        inner_left   = (min_x + inset_x) / w
+        inner_top    = (min_y + inset_y) / h
+        inner_right  = (max_x - inset_x) / w
+        inner_bottom = (max_y - inset_y) / h
+
+        # 7. Rotation (via minAreaRect)
+        rotation = 0.0
+        if card_contour is not None:
+            rect = cv2.minAreaRect(card_contour)
+            angle = rect[2]
+            # normalize to [-45,45]
+            if angle < -45:
+                angle += 90
+            elif angle > 45:
+                angle -= 90
+            rotation = float(f"{angle:.2f}")
+
+        return jsonify({
+            "outerEdges": {
+                "left": float(f"{outer_left:.4f}"),
+                "top": float(f"{outer_top:.4f}"),
+                "right": float(f"{outer_right:.4f}"),
+                "bottom": float(f"{outer_bottom:.4f}")
+            },
+            "innerEdges": {
+                "left": float(f"{inner_left:.4f}"),
+                "top": float(f"{inner_top:.4f}"),
+                "right": float(f"{inner_right:.4f}"),
+                "bottom": float(f"{inner_bottom:.4f}")
+            },
+            "rotation": rotation,
+            "confidence": 0.9
+        }), 200
+
+    except requests.RequestException as e:
+        return jsonify({"error": f"Download failed: {e}"}), 502
     except Exception as e:
-        return JSONResponse({"error":f"download failed: {e}"},400)
+        return jsonify({"error": f"Processing error: {e}"}), 500
 
-    # load
-    img = Image.open(io.BytesIO(r.content)).convert("RGB")
-    npimg = np.array(img)
-    H, W = npimg.shape[:2]
 
-    # edges
-    gray    = cv2.cvtColor(npimg, cv2.COLOR_RGB2GRAY)
-    blur    = cv2.GaussianBlur(gray, (5,5), 0)
-    edges   = cv2.Canny(blur, 50,150)
-
-    # Hough
-    lines = cv2.HoughLinesP(
-        edges, 1, np.pi/180,
-        threshold=80,
-        minLineLength=int(min(W,H)*0.7),
-        maxLineGap=40
-    )
-    if lines is None:
-        return JSONResponse({"error":"no lines"},500)
-
-    verts = []
-    hors  = []
-    for x1,y1,x2,y2 in lines[:,0]:
-        if abs(x1-x2) < abs(y1-y2)*0.3:
-            # vertical
-            verts.append((x1+x2)//2)
-        elif abs(y1-y2) < abs(x1-x2)*0.3:
-            # horizontal
-            hors.append((y1+y2)//2)
-
-    if not verts or not hors:
-        return JSONResponse({"error":"insufficient lines"},500)
-
-    # cluster / average
-    # top = smallest few hors, bottom = largest few
-    hors = sorted(hors)
-    top    = int(np.mean(hors[:max(1,len(hors)//5)]))
-    bottom = int(np.mean(hors[-max(1,len(hors)//5):]))
-    verts = sorted(verts)
-    left   = int(np.mean(verts[:max(1,len(verts)//5)]))
-    right  = int(np.mean(verts[-max(1,len(verts)//5):]))
-
-    # debug overlay
-    dbg = npimg.copy()
-    cv2.line(dbg, (left,0),(left,H),(0,255,0),3)
-    cv2.line(dbg, (right,0),(right,H),(0,255,0),3)
-    cv2.line(dbg, (0,top),(W,top),(0,255,0),3)
-    cv2.line(dbg, (0,bottom),(W,bottom),(0,255,0),3)
-
-    fn = f"{uuid.uuid4().hex}.jpg"
-    path = os.path.join(DEBUG_FOLDER, fn)
-    cv2.imwrite(path, cv2.cvtColor(dbg, cv2.COLOR_RGB2BGR))
-
-    # inner inset 10%
-    w_box = right-left
-    h_box = bottom-top
-    ix = left  + w_box*0.10
-    iy = top   + h_box*0.10
-    ox = right - w_box*0.10
-    oy = bottom- h_box*0.10
-
-    return {
-        "outerEdges": normalize({"left":left,"top":top,"right":right,"bottom":bottom}, W,H),
-        "innerEdges": normalize({"left":ix,"top":iy,"right":ox,"bottom":oy}, W,H),
-        "rotation": 0.0,
-        "confidence": 0.99,
-        "debug_image_url": f"/debug/{fn}"
-    }
-
-if __name__=="__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+if __name__ == '__main__':
+    # for local dev only
+    app.run(host='0.0.0.0', port=5000, debug=True)
