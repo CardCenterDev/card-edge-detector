@@ -1,4 +1,4 @@
-Flask>=2.0
+flask
 opencv-python-headless
+Pillow
 numpy
-requests
