@@ -4,3 +4,5 @@ Pillow
 numpy
 gunicorn
 flask-cors
+python-multipart
+inference-sdk
