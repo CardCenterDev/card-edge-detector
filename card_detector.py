@@ -1,5 +1,4 @@
-# card_detector.py (Roboflow-powered)
-
+import os
 from inference_sdk import InferenceHTTPClient
 from PIL import Image
 import io
