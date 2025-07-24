@@ -17,16 +17,21 @@ def resize_image_if_large(image_bytes, max_width=1280):
     """
     Resizes the image down if it's wider than max_width.
     Reduces memory usage before sending to Roboflow.
+    Also ensures the image is in RGB mode for JPEG saving.
     """
     image = Image.open(io.BytesIO(image_bytes))
+
+    if image.mode != "RGB":
+        image = image.convert("RGB")  # ✅ Convert to JPEG-safe mode
+
     if image.width > max_width:
         aspect_ratio = image.height / image.width
         new_height = int(max_width * aspect_ratio)
         image = image.resize((max_width, new_height))
-        buffer = io.BytesIO()
-        image.save(buffer, format="JPEG", quality=90)
-        return buffer.getvalue()
-    return image_bytes
+
+    buffer = io.BytesIO()
+    image.save(buffer, format="JPEG", quality=90)
+    return buffer.getvalue()
 
 def detect_card_edges_from_bytes(image_bytes):
     """
